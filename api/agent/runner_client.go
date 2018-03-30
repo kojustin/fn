@@ -16,6 +16,9 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// gRPCRunner sends functions and calls over GRPC to an agent that knows how
+// to run them and *gRPCRunner implements interface
+// github.com/fnproject/fn/api/runnerpool.Runner.
 type gRPCRunner struct {
 	// Need a WaitGroup of TryExec in flight
 	wg      sync.WaitGroup
@@ -24,6 +27,9 @@ type gRPCRunner struct {
 	client  pb.RunnerProtocolClient
 }
 
+var _ pool.Runner = &gRPCRunner{}
+
+// SecureGRPCRunnerFactory creates a pool.Runner which is a client of the runner at addr.
 func SecureGRPCRunnerFactory(addr, runnerCertCN string, pki *pool.PKIData) (pool.Runner, error) {
 	conn, client, err := runnerConnection(addr, runnerCertCN, pki)
 	if err != nil {

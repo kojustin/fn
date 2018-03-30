@@ -1,9 +1,16 @@
+// runner.proto defines the GRPC interface between the fn LB and the fn runner.
+// In these interactions the LB is the client and the runner is the server. The
+// LB tries to place work on to the runner and the runner may choose to accept
+// or reject that work.
+
 syntax = "proto3";
 
 import "google/protobuf/empty.proto";
 
 // Request to allocate a slot for a call
 message TryCall {
+    // models_calls_json carries contains a github.com/fnproject/fn/api/models.Call
+    // object serialized to JSON.
     string models_call_json = 1;
 }
 
@@ -47,10 +54,12 @@ message CallFinished {
     string details = 2;
 }
 
-
+// ClientMsg is things that the client sends to the server
 message ClientMsg {
     oneof body {
+        // TryCall is sent to the
         TryCall try = 1;
+        // DataFrame contains the body of a request.
         DataFrame data = 2;
     }
 }
@@ -69,6 +78,14 @@ message RunnerStatus {
 }
 
 service RunnerProtocol {
+    // The client calls Engage to start a session with the runner/server. Once
+    // the session is estabished the client may send a ClientMsg.TryCall
+    // message. In reply to that message the server sends a RunnerMsg.CallAcknowledged.
+    //
+    // If CallAcknowledged.committed = true that means the runner is ready to run the calls.
+    //
+    // The client should then send a stream of ClientMsg.DataFrame's each reresenting a
+    // single request.
     rpc Engage (stream ClientMsg) returns (stream RunnerMsg);
 
     // Rather than rely on Prometheus for this, expose status that's specific to the runner lifecycle through this.

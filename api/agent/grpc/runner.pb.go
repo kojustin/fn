@@ -44,6 +44,8 @@ const _ = proto.ProtoPackageIsVersion2 // please upgrade the proto package
 
 // Request to allocate a slot for a call
 type TryCall struct {
+	// models_calls_json carries contains a github.com/fnproject/fn/api/models.Call
+	// object serialized to JSON.
 	ModelsCallJson string `protobuf:"bytes,1,opt,name=models_call_json,json=modelsCallJson" json:"models_call_json,omitempty"`
 }
 
@@ -285,6 +287,7 @@ func (m *CallFinished) GetDetails() string {
 	return ""
 }
 
+// ClientMsg is things that the client sends to the server
 type ClientMsg struct {
 	// Types that are valid to be assigned to Body:
 	//	*ClientMsg_Try
@@ -629,6 +632,14 @@ const _ = grpc.SupportPackageIsVersion4
 // Client API for RunnerProtocol service
 
 type RunnerProtocolClient interface {
+	// The client calls Engage to start a session with the runner/server. Once
+	// the session is estabished the client may send a ClientMsg.TryCall
+	// message. In reply to that message the server sends a RunnerMsg.CallAcknowledged.
+	//
+	// If CallAcknowledged.committed = true that means the runner is ready to run the calls.
+	//
+	// The client should then send a stream of ClientMsg.DataFrame's each reresenting a
+	// single request.
 	Engage(ctx context.Context, opts ...grpc.CallOption) (RunnerProtocol_EngageClient, error)
 	// Rather than rely on Prometheus for this, expose status that's specific to the runner lifecycle through this.
 	Status(ctx context.Context, in *google_protobuf.Empty, opts ...grpc.CallOption) (*RunnerStatus, error)
@@ -685,6 +696,14 @@ func (c *runnerProtocolClient) Status(ctx context.Context, in *google_protobuf.E
 // Server API for RunnerProtocol service
 
 type RunnerProtocolServer interface {
+	// The client calls Engage to start a session with the runner/server. Once
+	// the session is estabished the client may send a ClientMsg.TryCall
+	// message. In reply to that message the server sends a RunnerMsg.CallAcknowledged.
+	//
+	// If CallAcknowledged.committed = true that means the runner is ready to run the calls.
+	//
+	// The client should then send a stream of ClientMsg.DataFrame's each reresenting a
+	// single request.
 	Engage(RunnerProtocol_EngageServer) error
 	// Rather than rely on Prometheus for this, expose status that's specific to the runner lifecycle through this.
 	Status(context.Context, *google_protobuf.Empty) (*RunnerStatus, error)

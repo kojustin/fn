@@ -240,8 +240,10 @@ func (prcm *pureRunnerCapacityManager) ReleaseCapacity(units uint64) {
 	panic("Fatal error in pure runner capacity calculation, getting to sub-zero capacity")
 }
 
-// pureRunner implements Agent and delegates execution of functions to an internal Agent; basically it wraps around it
-// and provides the gRPC server that implements the LB <-> Runner protocol.
+// pureRunner implements the interfaces Agent and RunnerProtocolServer. It
+// delegates execution of functions to an internal Agent; basically it wraps
+// around it and provides the gRPC server that implements the LB <-> Runner
+// protocol.
 type pureRunner struct {
 	gRPCServer *grpc.Server
 	listen     string
@@ -249,6 +251,11 @@ type pureRunner struct {
 	inflight   int32
 	capacity   CapacityGate
 }
+
+// These do-nothing variable assignments ensure that struct pureRunner
+// implement these interfaces, if not these assignments will fail to compile.
+var _ Agent = &pureRunner{}
+var _ runner.RunnerProtocolServer = &pureRunner{}
 
 func (pr *pureRunner) GetAppID(ctx context.Context, appName string) (string, error) {
 	return pr.a.GetAppID(ctx, appName)
@@ -358,14 +365,18 @@ func (pr *pureRunner) ensureFunctionIsRunning(state *callHandle) {
 	}
 }
 
-func (pr *pureRunner) handleData(ctx context.Context, data *runner.DataFrame, state *callHandle) error {
+func (pr *pureRunner) handleData(ctx context.Context, data *runner.DataFrame, state *callHandle, logEntry *logrus.Entry) error {
+	logEntry = logEntry.WithField("Function", "pureRunner.handleData")
 	pr.ensureFunctionIsRunning(state)
 
 	// Only push the input if we're in a non-error situation
+	logEntry.Debug("taking stateMutex")
 	state.stateMutex.Lock()
+	logEntry.Debug("have stateMutex")
 	defer state.stateMutex.Unlock()
 	if state.streamError == nil {
 		if len(data.Data) > 0 {
+			logEntry.Debug("writing bytes: %s", string(data.Data))
 			_, err := state.input.Write(data.Data)
 			if err != nil {
 				return err
@@ -378,7 +389,9 @@ func (pr *pureRunner) handleData(ctx context.Context, data *runner.DataFrame, st
 	return nil
 }
 
-func (pr *pureRunner) handleTryCall(ctx context.Context, tc *runner.TryCall, state *callHandle) (capacityDeallocator, error) {
+func (pr *pureRunner) handleTryCall(ctx context.Context, tc *runner.TryCall, state *callHandle, logEntry *logrus.Entry) (capacityDeallocator, error) {
+	logEntry = logEntry.WithField("Function", "pureRunner.handleTryCall")
+
 	state.receivedTime = strfmt.DateTime(time.Now())
 	var c models.Call
 	err := json.Unmarshal([]byte(tc.ModelsCallJson), &c)
@@ -396,31 +409,43 @@ func (pr *pureRunner) handleTryCall(ctx context.Context, tc *runner.TryCall, sta
 	var w http.ResponseWriter
 	w = state
 	inR, inW := io.Pipe()
+
+	logEntry.Debugf("Calling pr.a.GetCall")
 	agent_call, err := pr.a.GetCall(FromModelAndInput(&c, inR), WithWriter(w))
+	logEntry.Debugf("Finished pr.a.GetCall, agent_call=%+v; err=%s", agent_call, err)
 	if err != nil {
 		return func() { pr.capacity.ReleaseCapacity(c.Memory) }, err
 	}
+
+	logEntry.Debugf("Calling call")
 	state.c = agent_call.(*call)
+	logEntry.Debugf("Finished call, state.c=%+v", state.c)
 	state.input = inW
 	state.allocatedTime = strfmt.DateTime(time.Now())
 
 	return func() { pr.capacity.ReleaseCapacity(c.Memory) }, nil
 }
 
-// Handles a client engagement
+// Handles a client engagement.
+//
+// An engagement is a stream object.
 func (pr *pureRunner) Engage(engagement runner.RunnerProtocol_EngageServer) error {
 	// Keep lightweight tabs on what this runner is doing: for draindown tests
-	atomic.AddInt32(&pr.inflight, 1)
-	defer atomic.AddInt32(&pr.inflight, -1)
+	curr := atomic.AddInt32(&pr.inflight, 1)
+	logEntry := logrus.WithField("Engagement", curr).WithField("Function", "pureRunner.Engage")
+	defer func() {
+		atomic.AddInt32(&pr.inflight, -1)
+		logEntry.Debug()
+	}()
 
 	pv, ok := peer.FromContext(engagement.Context())
-	logrus.Debug("Starting engagement")
+	logEntry.Debug("Starting engagement")
 	if ok {
-		logrus.Debug("Peer is ", pv)
+		logEntry.Debug("Peer is ", pv)
 	}
 	md, ok := metadata.FromIncomingContext(engagement.Context())
 	if ok {
-		logrus.Debug("MD is ", md)
+		logEntry.Debug("MD is ", md)
 	}
 
 	var state = callHandle{
@@ -436,16 +461,19 @@ func (pr *pureRunner) Engage(engagement runner.RunnerProtocol_EngageServer) erro
 	}
 
 	grpc.EnableTracing = false
-	logrus.Debug("Entering engagement handler")
+	logEntry.Debug("Entering engagement handler")
 
 	msg, err := engagement.Recv()
 	if err != nil {
 		// In this case the connection has dropped before we've even started.
+		logEntry.Debug("didn't receive first message")
 		return err
 	}
 	switch body := msg.Body.(type) {
 	case *runner.ClientMsg_Try:
-		dealloc, err := pr.handleTryCall(engagement.Context(), body.Try, &state)
+		logEntry.Debug("Received tryCall msg: %+v", body)
+		dealloc, err := pr.handleTryCall(engagement.Context(), body.Try, &state, logEntry)
+		logEntry.Debug("handleTryCall finished dealloc=%+v, err=%s", dealloc, err)
 		defer dealloc()
 		// At the stage of TryCall, there is only one thread running and nothing has happened yet so there should
 		// not be a streamError. We can handle `err` by sending a message back. If we cause a stream error by sending
@@ -458,6 +486,7 @@ func (pr *pureRunner) Engage(engagement runner.RunnerProtocol_EngageServer) erro
 					Details:   fmt.Sprintf("%v", err),
 				}}})
 			state.cancel(engagement.Context(), err)
+			logEntry.Errorf("handleTryCall failed: %s, sending commited=false and cancelling", err)
 			return err
 		}
 
@@ -471,23 +500,32 @@ func (pr *pureRunner) Engage(engagement runner.RunnerProtocol_EngageServer) erro
 			}}})
 		if err != nil {
 			state.cancel(engagement.Context(), err)
+			logEntry.Errorf("handleTryCall succeeded failed to send committments and cancelling", err)
 			return err
 		}
+		logEntry.Debug("sending committed message")
 
 		// Then at this point we start handling the data that should be being pushed to us.
+		count := 0
 		foundEof := false
 		for !foundEof {
+			logEntry.Debugf("waiting for data frame %d", 0)
 			msg, err := engagement.Recv()
 			if err != nil {
 				// In this case the connection has dropped or there's something bad happening. We know we can't even
 				// send a message back. Cancel the call, all bets are off.
 				state.cancel(engagement.Context(), err)
+				logEntry.Errorf("engagement.Recv failed: %s")
 				return err
 			}
+			logEntry.Debug("received msg")
+			count = count + 1
 
 			switch body := msg.Body.(type) {
 			case *runner.ClientMsg_Data:
-				err := pr.handleData(engagement.Context(), body.Data, &state)
+				logEntry.Debugf("engagement.Recv received data frame %+v, handling.", body)
+				err := pr.handleData(engagement.Context(), body.Data, &state, logEntry)
+				logEntry.Debugf("data handling finished err=%s", err)
 				if err != nil {
 					// If this happens, then we couldn't write into the input. The state of the function is inconsistent
 					// and therefore we need to cancel. We also need to communicate back that the function has failed;
@@ -499,6 +537,7 @@ func (pr *pureRunner) Engage(engagement runner.RunnerProtocol_EngageServer) erro
 							Details: fmt.Sprintf("%v", err),
 						}}})
 					state.cancel(engagement.Context(), err)
+					logEntry.Errorf("engagement.Recv handleData failed: %s", err)
 					return err
 				}
 				// Then break the loop if this was the last input data frame, i.e. eof is on
@@ -516,6 +555,7 @@ func (pr *pureRunner) Engage(engagement runner.RunnerProtocol_EngageServer) erro
 						Details: fmt.Sprintf("%v", err),
 					}}})
 				state.cancel(engagement.Context(), err)
+				logEntry.Errorf("engagement.Recv expecting dataframe, got %+v", body)
 				return err
 			}
 		}
@@ -528,6 +568,7 @@ func (pr *pureRunner) Engage(engagement runner.RunnerProtocol_EngageServer) erro
 		}
 
 	default:
+		logEntry.Error("Expecting TryCall msg, got msg: %+v", body)
 		// Protocol error. This should not happen.
 		return errors.New("Protocol failure in communication with function runner")
 	}
