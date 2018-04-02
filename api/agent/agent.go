@@ -184,8 +184,11 @@ func (a *agent) Close() error {
 }
 
 func (a *agent) Submit(callI Call) error {
+	entry := logrus.WithField("Function", "agent.Submit()")
+	entry.Debugf("wg.add")
 	a.wg.Add(1)
 	defer a.wg.Done()
+	entry.Debugf("wg added")
 
 	select {
 	case <-a.shutdown:
@@ -202,7 +205,9 @@ func (a *agent) Submit(callI Call) error {
 	ctx, span := trace.StartSpan(ctx, "agent_submit")
 	defer span.End()
 
+	entry.Debugf("doing submit")
 	err := a.submit(ctx, call)
+	entry.Debugf("submit, done. err=%s", err)
 	return err
 }
 
@@ -232,13 +237,17 @@ func (a *agent) submit(ctx context.Context, call *call) error {
 	a.startStateTrackers(ctx, call)
 	defer a.endStateTrackers(ctx, call)
 
+	entry := logrus.WithField("Function", "agent.submit()")
+	entry.Debugf("get slot")
 	slot, err := a.getSlot(ctx, call)
 	if err != nil {
+		entry.Errorf("a.getSlot(%+v, %+v) failed %s", ctx, call, err)
 		handleStatsDequeue(ctx, err)
 		return transformTimeout(err, true)
 	}
 	defer slot.Close(ctx) // notify our slot is free once we're done
 
+	entry.Debugf("start")
 	err = call.Start(ctx)
 	if err != nil {
 		handleStatsDequeue(ctx, err)
@@ -248,8 +257,10 @@ func (a *agent) submit(ctx context.Context, call *call) error {
 	statsDequeueAndStart(ctx)
 
 	// pass this error (nil or otherwise) to end directly, to store status, etc
+	entry.Debugf("exec")
 	err = slot.exec(ctx, call)
 	handleStatsEnd(ctx, err)
+	entry.Debugf("exec done")
 
 	// TODO: we need to allocate more time to store the call + logs in case the call timed out,
 	// but this could put us over the timeout if the call did not reply yet (need better policy).
@@ -301,6 +312,7 @@ func handleStatsEnd(ctx context.Context, err error) {
 // request type, this may launch a new container or wait for other containers to become idle
 // or it may wait for resources to become available to launch a new container.
 func (a *agent) getSlot(ctx context.Context, call *call) (Slot, error) {
+	entry := logrus.WithField("Function", "agent.getSlot()")
 	// start the deadline context for waiting for slots
 	ctx, cancel := context.WithDeadline(ctx, call.slotDeadline)
 	defer cancel()
@@ -321,6 +333,8 @@ func (a *agent) getSlot(ctx context.Context, call *call) (Slot, error) {
 	}
 
 	call.requestState.UpdateState(ctx, RequestStateWait, call.slots)
+
+	entry.Debugf("call is %+v, preparing to launchCold", call)
 	return a.launchCold(ctx, call)
 }
 
@@ -600,12 +614,16 @@ func (s *hotSlot) exec(ctx context.Context, call *call) error {
 }
 
 func (a *agent) prepCold(ctx context.Context, call *call, tok ResourceToken, ch chan Slot) {
+	entry := logrus.WithField("Function", "agent.prepCold()")
 	ctx, span := trace.StartSpan(ctx, "agent_prep_cold")
 	defer span.End()
 
+	entry.Debugf("call is %+v, preparing to UpdateState", call)
 	call.containerState.UpdateState(ctx, ContainerStateStart, call.slots)
+	entry.Debugf("call is %+v, finished update state", call)
 
 	// add Fn-specific information to the config to shove everything into env vars for cold
+
 	call.Config["FN_DEADLINE"] = strfmt.DateTime(call.execDeadline).String()
 	call.Config["FN_METHOD"] = call.Model().Method
 	call.Config["FN_REQUEST_URL"] = call.Model().URL

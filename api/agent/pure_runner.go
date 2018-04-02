@@ -292,13 +292,15 @@ func (pr *pureRunner) Enqueue(context.Context, *models.Call) error {
 	return errors.New("Enqueue cannot be called directly in a Pure Runner.")
 }
 
-func (pr *pureRunner) ensureFunctionIsRunning(state *callHandle) {
+func (pr *pureRunner) ensureFunctionIsRunning(state *callHandle, logEntry *logrus.Entry) {
+	logEntry = logEntry.WithField("Function", "pureRunner.ensureFunctionIsRunning")
 	// Only start it once!
 	state.stateMutex.Lock()
 	defer state.stateMutex.Unlock()
 	if !state.started {
 		state.started = true
 		go func() {
+			logEntry.Debugf("Submit()! Agent=%p; %+v", pr.a, pr.a)
 			err := pr.a.Submit(state.c)
 			if err != nil {
 				// In this case the function has failed for a legitimate reason. We send a call failed message if we
@@ -318,9 +320,12 @@ func (pr *pureRunner) ensureFunctionIsRunning(state *callHandle) {
 					}
 				}
 				state.done <- err
+				logEntry.Errorf("Submit() failed: %s", err)
 				return
 			}
+
 			// First close the writer, then send the call finished message
+			logEntry.Debugf("state.Close()!")
 			err = state.Close()
 			if err != nil {
 				// If we fail to close the writer we need to communicate back that the function has failed; if there's
@@ -340,11 +345,13 @@ func (pr *pureRunner) ensureFunctionIsRunning(state *callHandle) {
 					}
 				}
 				state.done <- err
+				logEntry.Errorf("Close() failed: %s", err)
 				return
 			}
 			// At this point everything should have worked. Send a successful message... and if that runs afoul of a
 			// stream error, well, we're in a bit of trouble. Everything has finished, so there is nothing to cancel
 			// and we just give up, but at least we set streamError.
+			logEntry.Debugf("Send finished msg")
 			state.stateMutex.Lock()
 			defer state.stateMutex.Unlock()
 			if state.streamError == nil {
@@ -356,6 +363,7 @@ func (pr *pureRunner) ensureFunctionIsRunning(state *callHandle) {
 				if err2 != nil {
 					state.streamError = err2
 					state.done <- err2
+					logEntry.Errorf("Send finished msg failed: %s", err2)
 					return
 				}
 			}
@@ -363,11 +371,13 @@ func (pr *pureRunner) ensureFunctionIsRunning(state *callHandle) {
 			state.done <- nil
 		}()
 	}
+
+	logEntry.Debugf("done")
 }
 
 func (pr *pureRunner) handleData(ctx context.Context, data *runner.DataFrame, state *callHandle, logEntry *logrus.Entry) error {
 	logEntry = logEntry.WithField("Function", "pureRunner.handleData")
-	pr.ensureFunctionIsRunning(state)
+	pr.ensureFunctionIsRunning(state, logEntry)
 
 	// Only push the input if we're in a non-error situation
 	logEntry.Debug("taking stateMutex")
@@ -376,16 +386,19 @@ func (pr *pureRunner) handleData(ctx context.Context, data *runner.DataFrame, st
 	defer state.stateMutex.Unlock()
 	if state.streamError == nil {
 		if len(data.Data) > 0 {
-			logEntry.Debug("writing bytes: %s", string(data.Data))
-			_, err := state.input.Write(data.Data)
+			logEntry.Debug("Writing bytes: %s", string(data.Data))
+			countBytes, err := state.input.Write(data.Data)
+			logEntry.Debug("Write() count=%d, err=%s", countBytes, err)
 			if err != nil {
 				return err
 			}
 		}
 		if data.Eof {
+			logEntry.Debug("closing input")
 			state.input.Close()
 		}
 	}
+	logEntry.Debug("handleData finished.")
 	return nil
 }
 
@@ -605,6 +618,7 @@ func DefaultPureRunner(cancel context.CancelFunc, addr string, da DataAccess, ce
 
 func NewPureRunner(cancel context.CancelFunc, addr string, da DataAccess, cert string, key string, ca string, gate CapacityGate) (Agent, error) {
 	a := createAgent(da, true)
+	logrus.WithField("Function", "NewPureRunner").Debugf("Agent=%p; %+v", a, a)
 	var pr *pureRunner
 	var err error
 	if cert != "" && key != "" && ca != "" {
